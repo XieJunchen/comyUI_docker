@@ -43,7 +43,7 @@ RUN pip install --retries 3 --timeout 180 -r /app/requirements.txt
 RUN git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager.git /app/custom_nodes/ComfyUI-Manager \
     && git clone --depth=1 https://github.com/AIGODLIKE/AIGODLIKE-ComfyUI-Translation.git /app/custom_nodes/AIGODLIKE-ComfyUI-Translation \
     && pip install --retries 3 --timeout 180 -r /app/custom_nodes/ComfyUI-Manager/requirements.txt \
-    && pip install --retries 3 --timeout 180 -r /app/custom_nodes/AIGODLIKE-ComfyUI-Translation/requirements.txt
+    && if [ -f /app/custom_nodes/AIGODLIKE-ComfyUI-Translation/requirements.txt ]; then pip install --retries 3 --timeout 180 -r /app/custom_nodes/AIGODLIKE-ComfyUI-Translation/requirements.txt; fi
 
 # 生产镜像
 FROM python:3.10.11-slim AS production
@@ -62,7 +62,7 @@ RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free n
     && echo "deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
     && echo "deb https://mirrors.aliyun.com/debian bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 libgcc-s1 curl ca-certificates git \
+    && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 libgcc-s1 curl ca-certificates git gcc g++ \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
