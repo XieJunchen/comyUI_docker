@@ -29,7 +29,7 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # 先安装 typing-extensions，避免 PyTorch 依赖冲突
-RUN pip install --retries 3 --timeout 180 typing-extensions
+RUN pip install --retries 3 --timeout 180 typing-extensions decord
 # 安装 PyTorch 及相关包
 RUN pip install --retries 10 --timeout 600 --prefer-binary torch torchvision torchaudio -i https://download.pytorch.org/whl/cu128 --no-cache-dir
 
@@ -39,11 +39,72 @@ RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
 # 安装 ComfyUI 主依赖
 RUN pip install --retries 3 --timeout 180 -r /app/requirements.txt
 
-# 拉取 ComfyUI-Manager 和 AIGODLIKE-ComfyUI-Translation 代码，并安装依赖
-RUN git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager.git /app/custom_nodes/ComfyUI-Manager \
-    && git clone --depth=1 https://github.com/AIGODLIKE/AIGODLIKE-ComfyUI-Translation.git /app/custom_nodes/AIGODLIKE-ComfyUI-Translation \
-    && pip install --retries 3 --timeout 180 -r /app/custom_nodes/ComfyUI-Manager/requirements.txt \
-    && if [ -f /app/custom_nodes/AIGODLIKE-ComfyUI-Translation/requirements.txt ]; then pip install --retries 3 --timeout 180 -r /app/custom_nodes/AIGODLIKE-ComfyUI-Translation/requirements.txt; fi
+# 批量拉取 custom_nodes 并安装依赖（失败自动跳过）
+RUN set -e; \
+    for repo in \
+        "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
+        "ltdrdata/ComfyUI-Manager" \
+        "cubiq/ComfyUI_IPAdapter_plus" \
+        "Kosinkadink/ComfyUI-AnimateDiff-Evolved" \
+        "Fannovel16/comfyui_controlnet_aux" \
+        "pythongosssss/ComfyUI-Custom-Scripts" \
+        "kijai/ComfyUI-HunyuanVideoWrapper" \
+        "ltdrdata/ComfyUI-Impact-Pack" \
+        "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
+        "aigc-apps/EasyAnimate" \
+        "city96/ComfyUI-GGUF" \
+        "kijai/ComfyUI-SUPIR" \
+        "rgthree/rgthree-comfy" \
+        "Lightricks/ComfyUI-LTXVideo" \
+        "cubiq/ComfyUI_InstantID" \
+        "yolain/ComfyUI-Easy-Use" \
+        "XLabs-AI/x-flux-comfyui" \
+        "WASasquatch/was-node-suite-comfyui" \
+        "kijai/ComfyUI-CogVideoXWrapper" \
+        "kijai/ComfyUI-KJNodes" \
+        "logtd/ComfyUI-Fluxtapoz" \
+        "jags111/efficiency-nodes-comfyui" \
+        "kijai/ComfyUI-Florence2" \
+        "AlekPet/ComfyUI_Custom_Nodes_AlekPet" \
+        "crystian/ComfyUI-Crystools" \
+        "ssitu/ComfyUI_UltimateSDUpscale" \
+        "Kosinkadink/ComfyUI-VideoHelperSuite" \
+        "Acly/comfyui-inpaint-nodes" \
+        "Suzie1/ComfyUI_Comfyroll_CustomNodes" \
+        "nullquant/ComfyUI-BrushNet" \
+        "cubiq/PuLID_ComfyUI" \
+        "cubiq/ComfyUI_essentials" \
+        "welltop-cn/ComfyUI-TeaCache" \
+        "chrisgoringe/cg-use-everywhere" \
+        "Fannovel16/ComfyUI-Frame-Interpolation" \
+        "lquesada/ComfyUI-Inpaint-CropAndStitch" \
+        "TTPlanetPig/Comfyui_TTP_Toolset" \
+        "melMass/comfy_mtb" \
+        "john-mnz/ComfyUI-Inspyrenet-Rembg" \
+        "EvilBT/ComfyUI_SLK_joy_caption_two" \
+        "kijai/ComfyUI-DepthAnythingV2" \
+        "chflame163/ComfyUI_LayerStyle_Advance" \
+        "logtd/ComfyUI-MochiEdit" \
+        "facok/ComfyUI-HunyuanVideoMultiLora" \
+        "MinusZoneAI/ComfyUI-CogVideoX-MZ" \
+        "facok/ComfyUI-TeaCacheHunyuanVideo" \
+        "XieJunchen/comfyUI_LLM" \
+        "chflame163/ComfyUI_LayerStyle" \
+        "cubiq/ComfyUI_FaceAnalysis" \
+        "nicofdga/DZ-FaceDetailer" \
+        ; do \
+        git clone --depth=1 https://github.com/$repo.git /app/custom_nodes/$(basename $repo) || true; \
+        if [ -f /app/custom_nodes/$(basename $repo)/requirements.txt ]; then \
+            sed -i '/diffusers/d;/peft/d;/accelerate/d' /app/custom_nodes/$(basename $repo)/requirements.txt; \
+            pip install --retries 3 --timeout 180 -r /app/custom_nodes/$(basename $repo)/requirements.txt || true; \
+        fi; \
+        if [ -f /app/custom_nodes/$(basename $repo)/install.py ]; then \
+            python /app/custom_nodes/$(basename $repo)/install.py || true; \
+        fi; \
+    done
+
+# 安装新版本 diffusers、peft、accelerate、huggingface_hub
+RUN pip install --force-reinstall --no-cache-dir diffusers==0.31.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.23.2
 
 # 生产镜像
 FROM python:3.10.11-slim AS production
