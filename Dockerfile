@@ -29,9 +29,9 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # 先安装 typing-extensions，避免 PyTorch 依赖冲突
-RUN pip install --retries 3 --timeout 180 typing-extensions decord
-# 安装 PyTorch 及相关包
-RUN pip install --retries 10 --timeout 600 --prefer-binary torch torchvision torchaudio -i https://download.pytorch.org/whl/cu128 --no-cache-dir
+RUN pip install --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
+# 安装 PyTorch 及官方推荐 torchaudio
+RUN pip install --retries 10 --timeout 600 --prefer-binary torch==2.7.1+cu126 torchvision==0.18.1+cu126 torchaudio==2.1.1+cu126 -f https://download.pytorch.org/whl/cu128/torch_stable.html --no-cache-dir
 
 # 拉取 ComfyUI 代码
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
@@ -105,6 +105,10 @@ RUN set -e; \
 
 # 安装新版本 diffusers、peft、accelerate、huggingface_hub
 RUN pip install --force-reinstall --no-cache-dir diffusers==0.31.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.23.2
+
+# 额外补充依赖，解决部分 custom_nodes 启动自动下载问题
+# xformers 可直接安装，flash-attn 需 CUDA_HOME 环境且不适合无nvcc的容器，故跳过
+RUN pip install --retries 4 --timeout 600 xformers deep-translator googletrans-py stanza==1.1.1 ctranslate2==4.6.0 sacremoses==0.0.53
 
 # 生产镜像
 FROM python:3.10.11-slim AS production
