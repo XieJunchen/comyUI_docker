@@ -30,8 +30,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # 先安装 typing-extensions，避免 PyTorch 依赖冲突
 RUN pip install --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
-# 安装 PyTorch 及官方推荐 torchaudio
-RUN pip install --retries 10 --timeout 600 --prefer-binary torch==2.7.1+cu126 torchvision==0.18.1+cu126 torchaudio==2.1.1+cu126 -f https://download.pytorch.org/whl/cu128/torch_stable.html --no-cache-dir
+# 安装 PyTorch 及官方推荐 torchaudio（禁用 hash 校验，避免国内镜像 hash 不一致导致构建失败）
+RUN pip install --retries 10 --timeout 600 --prefer-binary --no-cache-dir --no-deps --trusted-host pypi.tuna.tsinghua.edu.cn torch==2.7.1 torchvision==0.18.1 torchaudio==2.1.1 -f https://download.pytorch.org/whl/cu128/torch_stable.html || \
+    pip install --retries 10 --timeout 600 --prefer-binary --no-cache-dir torch==2.7.1 torchvision==0.18.1 torchaudio==2.1.1 -f https://download.pytorch.org/whl/cu128/torch_stable.html
 
 # 拉取 ComfyUI 代码
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
