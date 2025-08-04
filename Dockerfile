@@ -104,8 +104,9 @@ RUN set -e; \
         fi; \
     done
 
-# 安装新版本 diffusers、peft、accelerate、huggingface_hub
-RUN pip install --force-reinstall --no-cache-dir diffusers==0.31.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.23.2
+# 安装新版本 diffusers、peft、accelerate、huggingface_hub（huggingface_hub 升级到 >=0.34.0，兼容 transformers）
+RUN pip install --retries 4 --timeout 180 --no-cache-dir --trusted-host pypi.tuna.tsinghua.edu.cn --no-deps diffusers==0.32.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0 || \
+    pip install --retries 4 --timeout 180 --no-cache-dir diffusers==0.32.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0
 
 # 额外补充依赖，解决部分 custom_nodes 启动自动下载问题
 # xformers 可直接安装，flash-attn 需 CUDA_HOME 环境且不适合无nvcc的容器，故跳过
