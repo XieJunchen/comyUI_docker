@@ -35,7 +35,9 @@ RUN pip install --retries 10 --timeout 600 --prefer-binary --no-cache-dir --no-d
     pip install --retries 10 --timeout 600 --prefer-binary --no-cache-dir torch==2.7.1 torchvision==0.18.1 torchaudio==2.1.1 -f https://download.pytorch.org/whl/cu128/torch_stable.html
 
 # 拉取 ComfyUI 代码
-RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app && \
+    cd /app && \
+    git checkout tags/v0.3.49
 
 # 安装 ComfyUI 主依赖
 RUN pip install --retries 3 --timeout 180 -r /app/requirements.txt
