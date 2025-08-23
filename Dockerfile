@@ -1,46 +1,40 @@
-# 基础镜像
+# ========================
+# 构建阶段（builder）
+# ========================
 FROM python:3.10.11-slim AS builder
 
-# 环境变量
+# 设置Python相关环境变量，优化输出和pip行为
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100
 
-# pip国内源
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    && pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
-
-# 构建依赖（阿里云源）
-RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list \
-    && echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
-    && echo "deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
-    && echo "deb https://mirrors.aliyun.com/debian bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
-    && apt-get update \
+# 安装系统依赖（编译工具、git等）
+RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc g++ python3-dev libffi-dev libssl-dev build-essential git wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 升级pip
-RUN pip install --upgrade pip setuptools wheel
+# 升级pip及常用构建工具
+RUN pip install --upgrade pip setuptools wheel --no-cache-dir
 
-# 虚拟环境
+# 创建虚拟环境，后续所有包都装到这里
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# 先安装 typing-extensions，避免 PyTorch 依赖冲突
-RUN pip install --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
-# 安装 PyTorch 及官方推荐 torchaudio（禁用 hash 校验，避免国内镜像 hash 不一致导致构建失败）
-RUN pip install --retries 10 --timeout 600 --prefer-binary --no-cache-dir --no-deps --trusted-host pypi.tuna.tsinghua.edu.cn torch==2.7.1 torchvision==0.18.1 torchaudio==2.1.1 -f https://download.pytorch.org/whl/cu128/torch_stable.html || \
-    pip install --retries 10 --timeout 600 --prefer-binary --no-cache-dir torch==2.7.1 torchvision==0.18.1 torchaudio==2.1.1 -f https://download.pytorch.org/whl/cu128/torch_stable.html
+# 先安装typing-extensions等，避免PyTorch依赖冲突
+RUN pip install --no-cache-dir --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
 
-# 拉取 ComfyUI 代码
+# 安装PyTorch、torchvision、torchaudio（严格版本对应，官方whl源，禁用缓存）
+RUN pip install --no-cache-dir --retries 10 --timeout 600 torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 -f https://download.pytorch.org/whl/cu118/torch_stable.html
+
+# 拉取ComfyUI主程序代码
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
 
-# 安装 ComfyUI 主依赖
-RUN pip install --retries 3 --timeout 180 -r /app/requirements.txt
+# 安装ComfyUI主依赖
+RUN pip install --no-cache-dir --retries 3 --timeout 180 -r /app/requirements.txt
 
-# 批量拉取 custom_nodes 并安装依赖（失败自动跳过）
+# 拉取custom_nodes并安装其依赖（失败自动跳过）
 RUN set -e; \
     for repo in \
         "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
@@ -97,25 +91,26 @@ RUN set -e; \
         git clone --depth=1 https://github.com/$repo.git /app/custom_nodes/$(basename $repo) || true; \
         if [ -f /app/custom_nodes/$(basename $repo)/requirements.txt ]; then \
             sed -i '/diffusers/d;/peft/d;/accelerate/d' /app/custom_nodes/$(basename $repo)/requirements.txt; \
-            pip install --retries 3 --timeout 180 -r /app/custom_nodes/$(basename $repo)/requirements.txt || true; \
+            pip install --no-cache-dir --retries 3 --timeout 180 -r /app/custom_nodes/$(basename $repo)/requirements.txt || true; \
         fi; \
         if [ -f /app/custom_nodes/$(basename $repo)/install.py ]; then \
             python /app/custom_nodes/$(basename $repo)/install.py || true; \
         fi; \
     done
 
-# 安装新版本 diffusers、peft、accelerate、huggingface_hub（huggingface_hub 升级到 >=0.34.0，兼容 transformers）
-RUN pip install --retries 4 --timeout 180 --no-cache-dir --trusted-host pypi.tuna.tsinghua.edu.cn --no-deps diffusers==0.32.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0 || \
-    pip install --retries 4 --timeout 180 --no-cache-dir diffusers==0.32.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0
+# 安装新版本diffusers、peft、accelerate、huggingface_hub，兼容transformers
+RUN pip install --no-cache-dir --retries 4 --timeout 180 diffusers==0.32.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0
 
-# 额外补充依赖，解决部分 custom_nodes 启动自动下载问题
-# xformers 可直接安装，flash-attn 需 CUDA_HOME 环境且不适合无nvcc的容器，故跳过
-RUN pip install --retries 4 --timeout 600 xformers deep-translator googletrans-py stanza==1.1.1 ctranslate2==4.6.0 sacremoses==0.0.53
+# 额外补充依赖，解决部分custom_nodes启动自动下载问题
+RUN pip install --no-cache-dir --retries 4 --timeout 600 xformers deep-translator googletrans-py stanza==1.1.1 ctranslate2==4.6.0 sacremoses==0.0.53
 
-# 生产镜像
+
+# ========================
+# 生产阶段（production）
+# ========================
 FROM python:3.10.11-slim AS production
 
-# 环境变量
+# 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
@@ -123,7 +118,7 @@ ENV PYTHONUNBUFFERED=1 \
     COMFYUI_HOST=0.0.0.0 \
     INSTALL_COMFYUI_MANAGER=false
 
-# 运行依赖（阿里云源，增加 git）
+# 安装运行时依赖
 RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list \
     && echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
     && echo "deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
@@ -133,18 +128,25 @@ RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free n
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# 复制虚拟环境和代码
+# 复制虚拟环境和主程序代码
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app /app
 
-# 创建非root用户
+# 创建非root用户，提升安全性
 RUN groupadd -r comfyui && useradd -r -g comfyui -d /app -s /bin/bash comfyui \
     && chown -R comfyui:comfyui /opt/venv /app
 
 # 设置工作目录
 WORKDIR /app
 
+# 切换到非root用户
 USER comfyui
+
+# 暴露端口
 EXPOSE $COMFYUI_PORT
+
+# 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD curl -f http://localhost:$COMFYUI_PORT/ || exit 1
+
+# 启动命令
 CMD ["sh", "-c", "python main.py --listen $COMFYUI_HOST --port $COMFYUI_PORT"]
