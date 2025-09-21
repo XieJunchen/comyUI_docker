@@ -36,27 +36,33 @@ RUN pip install --no-cache-dir --retries 3 --timeout 180 -r /app/requirements.tx
 
 # 拉取custom_nodes并安装其依赖（失败自动跳过）
 RUN set -e; \
-    for repo in \
+for repo in \
         "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
         "ltdrdata/ComfyUI-Manager" \
+        "kijai/ComfyUI-SUPIR" \
+        "kijai/ComfyUI-WanVideoWrapper" \
+        "kijai/ComfyUI-HunyuanVideoWrapper" \
+        "kijai/ComfyUI-CogVideoXWrapper" \
+        "kijai/ComfyUI-KJNodes" \
+        "kijai/ComfyUI-DepthAnythingV2" \
+        "jamesWalker55/comfyui-various" \
+        "billwuhao/ComfyUI_IndexTTS" \
+        "nunchaku-tech/ComfyUI-nunchaku" \
+        "christian-byrne/audio-separation-nodes-comfyui" \
         "cubiq/ComfyUI_IPAdapter_plus" \
         "Kosinkadink/ComfyUI-AnimateDiff-Evolved" \
         "Fannovel16/comfyui_controlnet_aux" \
         "pythongosssss/ComfyUI-Custom-Scripts" \
-        "kijai/ComfyUI-HunyuanVideoWrapper" \
         "ltdrdata/ComfyUI-Impact-Pack" \
         "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
         "aigc-apps/EasyAnimate" \
         "city96/ComfyUI-GGUF" \
-        "kijai/ComfyUI-SUPIR" \
         "rgthree/rgthree-comfy" \
         "Lightricks/ComfyUI-LTXVideo" \
         "cubiq/ComfyUI_InstantID" \
         "yolain/ComfyUI-Easy-Use" \
         "XLabs-AI/x-flux-comfyui" \
         "WASasquatch/was-node-suite-comfyui" \
-        "kijai/ComfyUI-CogVideoXWrapper" \
-        "kijai/ComfyUI-KJNodes" \
         "logtd/ComfyUI-Fluxtapoz" \
         "jags111/efficiency-nodes-comfyui" \
         "kijai/ComfyUI-Florence2" \
@@ -77,7 +83,6 @@ RUN set -e; \
         "melMass/comfy_mtb" \
         "john-mnz/ComfyUI-Inspyrenet-Rembg" \
         "EvilBT/ComfyUI_SLK_joy_caption_two" \
-        "kijai/ComfyUI-DepthAnythingV2" \
         "chflame163/ComfyUI_LayerStyle_Advance" \
         "logtd/ComfyUI-MochiEdit" \
         "facok/ComfyUI-HunyuanVideoMultiLora" \
@@ -99,7 +104,7 @@ RUN set -e; \
     done
 
 # 安装新版本diffusers、peft、accelerate、huggingface_hub，兼容transformers
-RUN pip install --no-cache-dir --retries 4 --timeout 180 diffusers==0.32.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0
+RUN pip install --no-cache-dir --retries 4 --timeout 180 diffusers==0.35.0 peft==0.10.0 accelerate==0.27.2 huggingface_hub==0.34.0 transformers==4.40.0
 
 # 额外补充依赖，解决部分custom_nodes启动自动下载问题
 RUN pip install --no-cache-dir --retries 4 --timeout 600 xformers deep-translator googletrans-py stanza==1.1.1 ctranslate2==4.6.0 sacremoses==0.0.53
