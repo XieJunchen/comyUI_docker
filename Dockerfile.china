@@ -46,6 +46,7 @@ for repo in \
     "kijai/ComfyUI-CogVideoXWrapper" \
     "kijai/ComfyUI-KJNodes" \
     "kijai/ComfyUI-DepthAnythingV2" \
+    "kijai/ComfyUI-WanAnimatePreprocess" \
     "jamesWalker55/comfyui-various" \
     "billwuhao/ComfyUI_IndexTTS" \
     "nunchaku-tech/ComfyUI-nunchaku" \
@@ -112,7 +113,8 @@ RUN pip install --force-reinstall --no-deps --no-cache-dir tokenizers==0.21.2 di
 RUN pip install --force-reinstall --no-deps --no-cache-dir stanza==1.1.1 argostranslate==1.9.6
 RUN pip install --no-cache-dir emoji==2.14.1
 # sam2 必须去掉 --no-deps，且放最后
-RUN pip install --no-cache-dir sam2==1.1.0 pynini==2.1.6
+RUN pip install pynini==2.1.6 WeTextProcessing deep-translator
+RUN pip install sam2==1.1.0
 
 
 # ========================
