@@ -1,0 +1,369 @@
+# ========================
+# 构建阶段（builder）
+# ========================
+FROM python:3.10.11-slim AS builder
+
+# 设置Python相关环境变量，优化输出和pip行为
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=100
+
+# 安装系统依赖（编译工具、git等）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ python3-dev libffi-dev libssl-dev build-essential git wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升级pip及常用构建工具
+RUN pip install --upgrade pip setuptools wheel 
+
+# 创建虚拟环境，后续所有包都装到这里
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 先安装typing-extensions等，避免PyTorch依赖冲突
+RUN pip install  --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
+
+# 安装PyTorch、torchvision、torchaudio（严格版本对应，官方whl源，禁用缓存）
+RUN pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir
+
+# 创建ComfyUI主程序智能更新脚本
+COPY <<EOF /tmp/update_comfyui.sh
+#!/bin/bash
+set -e
+REPO_URL="https://github.com/comfyanonymous/ComfyUI.git"
+TARGET_DIR="/app"
+
+echo "Setting up ComfyUI main repository..."
+
+# 如果目录已存在且包含.git，尝试更新
+if [ -d "\$TARGET_DIR/.git" ]; then
+    echo "ComfyUI directory exists, attempting to update..."
+    cd \$TARGET_DIR
+    # 尝试拉取最新代码
+    if git pull origin master 2>/dev/null || git pull origin main 2>/dev/null; then
+        echo "Successfully updated ComfyUI to latest version"
+    else
+        echo "Update failed, re-cloning ComfyUI..."
+        cd /
+        rm -rf \$TARGET_DIR
+        git clone --depth=1 \$REPO_URL \$TARGET_DIR
+        echo "Successfully re-cloned ComfyUI"
+    fi
+else
+    # 全新克隆
+    echo "Cloning ComfyUI for the first time..."
+    git clone --depth=1 \$REPO_URL \$TARGET_DIR
+    echo "Successfully cloned ComfyUI"
+fi
+
+echo "ComfyUI setup completed"
+EOF
+
+RUN chmod +x /tmp/update_comfyui.sh && /tmp/update_comfyui.sh && mv /tmp/update_comfyui.sh /app/
+
+# 安装ComfyUI主依赖
+RUN pip install  --retries 2 --timeout 180 -r /app/requirements.txt
+
+# 创建custom_nodes目录
+RUN mkdir -p /app/custom_nodes
+
+# 创建优化的安装脚本，支持缓存和最新代码拉取
+COPY <<EOF /app/install_node.sh
+#!/bin/bash
+set -e
+REPO=\$1
+NODE_NAME=\$(basename \$REPO)
+CACHE_BUST=\$2
+
+echo "Installing custom node: \$REPO"
+
+# 如果目录已存在且没有缓存破坏标志，则尝试更新
+if [ -d "/app/custom_nodes/\$NODE_NAME" ] && [ -z "\$CACHE_BUST" ]; then
+    echo "Directory exists, attempting to update \$NODE_NAME..."
+    cd /app/custom_nodes/\$NODE_NAME
+    # 尝试拉取最新代码，如果失败则重新克隆
+    if ! git pull origin main 2>/dev/null && ! git pull origin master 2>/dev/null; then
+        echo "Update failed, re-cloning \$NODE_NAME..."
+        cd /app/custom_nodes
+        rm -rf \$NODE_NAME
+        git clone --depth=1 https://github.com/\$REPO.git \$NODE_NAME || true
+    fi
+else
+    # 全新克隆
+    echo "Cloning \$NODE_NAME..."
+    git clone --depth=1 https://github.com/\$REPO.git /app/custom_nodes/\$NODE_NAME || true
+fi
+
+# 安装依赖
+if [ -f /app/custom_nodes/\$NODE_NAME/requirements.txt ]; then
+    echo "Installing requirements for \$NODE_NAME..."
+    # 创建临时requirements文件，过滤冲突包
+    grep -v -E '^(diffusers|peft|accelerate|transformers)' /app/custom_nodes/\$NODE_NAME/requirements.txt > /tmp/filtered_requirements.txt 2>/dev/null || cp /app/custom_nodes/\$NODE_NAME/requirements.txt /tmp/filtered_requirements.txt
+    pip install --retries 3 --timeout 180 -r /tmp/filtered_requirements.txt || true
+    rm -f /tmp/filtered_requirements.txt
+fi
+
+# 运行安装脚本
+if [ -f /app/custom_nodes/\$NODE_NAME/install.py ]; then
+    echo "Running install script for \$NODE_NAME..."
+    cd /app/custom_nodes/\$NODE_NAME
+    python install.py || true
+fi
+
+echo "Completed installation of \$NODE_NAME"
+EOF
+
+RUN chmod +x /app/install_node.sh
+
+# 创建节点列表文件以优化缓存层
+# 核心功能节点（最稳定，变化最少）
+COPY <<EOF /app/core_nodes.txt
+AIGODLIKE/AIGODLIKE-ComfyUI-Translation
+ltdrdata/ComfyUI-Manager
+pythongosssss/ComfyUI-Custom-Scripts
+cubiq/ComfyUI_essentials
+chrisgoringe/cg-use-everywhere
+EOF
+
+# 图像处理节点（较稳定）
+COPY <<EOF /app/image_nodes.txt
+cubiq/ComfyUI_IPAdapter_plus
+Fannovel16/comfyui_controlnet_aux
+ltdrdata/ComfyUI-Impact-Pack
+cubiq/ComfyUI_InstantID
+Acly/comfyui-inpaint-nodes
+nullquant/ComfyUI-BrushNet
+cubiq/PuLID_ComfyUI
+EOF
+
+# 视频处理节点（中等稳定性）
+COPY <<EOF /app/video_nodes.txt
+Kosinkadink/ComfyUI-AnimateDiff-Evolved
+Kosinkadink/ComfyUI-VideoHelperSuite
+Fannovel16/ComfyUI-Frame-Interpolation
+kijai/ComfyUI-WanVideoWrapper
+kijai/ComfyUI-HunyuanVideoWrapper
+kijai/ComfyUI-CogVideoXWrapper
+Lightricks/ComfyUI-LTXVideo
+EOF
+
+# AI模型相关节点（更新较频繁）
+COPY <<EOF /app/ai_model_nodes.txt
+kijai/ComfyUI-SUPIR
+kijai/ComfyUI-Florence2
+kijai/ComfyUI-DepthAnythingV2
+XLabs-AI/x-flux-comfyui
+city96/ComfyUI-GGUF
+aigc-apps/EasyAnimate
+EOF
+
+# 工具类节点（中等稳定性）
+COPY <<EOF /app/utility_nodes.txt
+kijai/ComfyUI-KJNodes
+jamesWalker55/comfyui-various
+WASasquatch/was-node-suite-comfyui
+jags111/efficiency-nodes-comfyui
+AlekPet/ComfyUI_Custom_Nodes_AlekPet
+crystian/ComfyUI-Crystools
+ssitu/ComfyUI_UltimateSDUpscale
+EOF
+
+# 界面增强节点（较稳定）
+COPY <<EOF /app/ui_nodes.txt
+rgthree/rgthree-comfy
+yolain/ComfyUI-Easy-Use
+Suzie1/ComfyUI_Comfyroll_CustomNodes
+melMass/comfy_mtb
+TTPlanetPig/Comfyui_TTP_Toolset
+EOF
+
+# 专业功能节点（更新频繁）
+COPY <<EOF /app/professional_nodes.txt
+kijai/ComfyUI-WanAnimatePreprocess
+lrzjason/Comfyui-QwenEditUtils
+billwuhao/ComfyUI_IndexTTS
+wildminder/ComfyUI-VoxCPM
+christian-byrne/audio-separation-nodes-comfyui
+logtd/ComfyUI-Fluxtapoz
+lquesada/ComfyUI-Inpaint-CropAndStitch
+EOF
+
+# 高级功能节点（更新频繁）
+COPY <<EOF /app/advanced_nodes.txt
+john-mnz/ComfyUI-Inspyrenet-Rembg
+EvilBT/ComfyUI_SLK_joy_caption_two
+chflame163/ComfyUI_LayerStyle_Advance
+logtd/ComfyUI-MochiEdit
+chflame163/ComfyUI_LayerStyle
+cubiq/ComfyUI_FaceAnalysis
+nicofdga/DZ-FaceDetailer
+EOF
+
+# 缓存和优化节点（更新最频繁）
+COPY <<EOF /app/cache_nodes.txt
+welltop-cn/ComfyUI-TeaCache
+facok/ComfyUI-HunyuanVideoMultiLora
+MinusZoneAI/ComfyUI-CogVideoX-MZ
+facok/ComfyUI-TeaCacheHunyuanVideo
+EOF
+
+# 个人定制节点（变化最频繁）
+COPY <<EOF /app/custom_nodes.txt
+XieJunchen/comfyUI_LLM
+EOF
+
+# 创建批量安装脚本
+COPY <<EOF /app/install_nodes_from_file.sh
+#!/bin/bash
+set -e
+FILE=\$1
+CACHE_BUST=\$2
+echo "Installing nodes from \$FILE..."
+while IFS= read -r repo || [ -n "\$repo" ]; do
+    # 跳过空行和注释行
+    [[ -z "\$repo" || "\$repo" =~ ^[[:space:]]*# ]] && continue
+    /app/install_node.sh "\$repo" "\$CACHE_BUST"
+done < "\$FILE"
+echo "Completed installing nodes from \$FILE"
+EOF
+
+RUN chmod +x /app/install_nodes_from_file.sh
+
+# 分层安装节点（按稳定性分层，利用Docker缓存）
+# 第1层：核心功能节点（最稳定，缓存效果最好）
+RUN /app/install_nodes_from_file.sh /app/core_nodes.txt
+
+# 第2层：图像处理节点（较稳定）
+RUN /app/install_nodes_from_file.sh /app/image_nodes.txt
+
+# 第3层：界面增强节点（较稳定）
+RUN /app/install_nodes_from_file.sh /app/ui_nodes.txt
+
+# 第4层：工具类节点（中等稳定性）
+RUN /app/install_nodes_from_file.sh /app/utility_nodes.txt
+
+# 第5层：视频处理节点（中等稳定性）
+RUN /app/install_nodes_from_file.sh /app/video_nodes.txt
+
+# 第6层：AI模型相关节点（更新较频繁）
+RUN /app/install_nodes_from_file.sh /app/ai_model_nodes.txt
+
+# 第7层：专业功能节点（更新频繁）
+RUN /app/install_nodes_from_file.sh /app/professional_nodes.txt
+
+# 第8层：高级功能节点（更新频繁）
+RUN /app/install_nodes_from_file.sh /app/advanced_nodes.txt
+
+# 第9层：缓存和优化节点（更新最频繁）
+RUN /app/install_nodes_from_file.sh /app/cache_nodes.txt
+
+# 第10层：个人定制节点（变化最频繁，缓存破坏最小）
+RUN /app/install_nodes_from_file.sh /app/custom_nodes.txt
+
+# 清理安装脚本
+RUN rm /app/install_node.sh
+
+# 统一主依赖版本，彻底覆盖所有冲突
+RUN pip install --force-reinstall --no-deps --no-cache-dir tokenizers==0.21.2 diffusers==0.35.1 transformers==4.54.1 accelerate==0.34.0 peft==0.17.1 huggingface_hub==0.34.0 moviepy numpy==1.26.4 scipy==1.11.4 spacy
+RUN pip install --force-reinstall --no-deps --no-cache-dir stanza==1.1.1 argostranslate==1.9.6
+RUN pip install --no-cache-dir emoji==2.14.1
+
+# ===== 补丁修复：解决内网启动日志中的错误 =====
+
+# 添加缺失的Python包安装 (解决日志中的 No module named 错误)
+RUN pip install --no-cache-dir --retries 4 --timeout 600 \
+    # 解决翻译相关错误
+    googletrans-py==4.0.0 \
+    ctranslate2==4.6.0 \
+    # 解决AI模型相关错误
+    nunchaku \
+    # 解决性能加速库缺失
+    xformers \
+    flash-attn \
+    sageattention \
+    # 解决其他缺失依赖
+    librosa \
+    soundfile \
+    opencv-python \
+    pillow-simd \
+    transparent-background \
+    albumentations \
+    || true
+
+# # 预下载关键模型文件，避免运行时网络错误
+# RUN mkdir -p /app/models/animatediff_models && \
+#     cd /app/models/animatediff_models && \
+#     # 下载AnimateDiff基础模型
+#     wget -O mm_sd_v15_v2.ckpt "https://huggingface.co/guoyww/animatediff/resolve/main/mm_sd_v15_v2.ckpt" || \
+#     echo "AnimateDiff model download failed, will be downloaded at runtime"
+
+# # 预下载FaceDetailer模型
+# RUN mkdir -p /app/custom_nodes/DZ-FaceDetailer/models && \
+#     cd /app/custom_nodes/DZ-FaceDetailer/models && \
+#     wget -O face_yolov8n.pt "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8n.pt" || \
+#     echo "FaceDetailer model download failed, will be downloaded at runtime"
+
+# 预下载ControlNet Aux需要的一些模型
+RUN mkdir -p /app/custom_nodes/comfyui_controlnet_aux/ckpts && \
+    cd /app/custom_nodes/comfyui_controlnet_aux/ckpts && \
+    # 下载DWPose模型 (如果网络允许)
+    wget -O dw-ll_ucoco_384.onnx "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx" || \
+    echo "DWPose model download failed, will be downloaded at runtime"
+
+# 创建离线配置，减少运行时网络请求
+RUN mkdir -p /app/user/default/ComfyUI-Manager && \
+    echo '{"check_for_updates": false, "send_telemetry": false}' > /app/user/default/ComfyUI-Manager/config.ini || true
+
+# sam2 必须去掉 --no-deps，且放最后
+RUN pip install sam2==1.1.0
+
+# ========================
+# 生产阶段（production）
+# ========================
+FROM python:3.10.11-slim AS production
+
+# 设置环境变量
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    COMFYUI_PORT=8188 \
+    COMFYUI_HOST=0.0.0.0 \
+    INSTALL_COMFYUI_MANAGER=false \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+# 安装运行时依赖
+RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 libgcc-s1 curl ca-certificates git gcc g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# 复制虚拟环境和主程序代码
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app /app
+
+# 创建非root用户，提升安全性
+RUN groupadd -r comfyui && useradd -r -g comfyui -d /app -s /bin/bash comfyui \
+    && chown -R comfyui:comfyui /opt/venv /app
+
+# 设置工作目录
+WORKDIR /app
+
+# 切换到非root用户
+USER comfyui
+
+# 暴露端口
+EXPOSE $COMFYUI_PORT
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD curl -f http://localhost:$COMFYUI_PORT/ || exit 1
+
+# 启动命令
+CMD ["sh", "-c", "python main.py --listen $COMFYUI_HOST --port $COMFYUI_PORT"]
