@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_DEFAULT_TIMEOUT=100
+    PIP_DEFAULT_TIMEOUT=600
 
 # 安装系统依赖（编译工具、git等）
 RUN apt-get update \
@@ -26,7 +26,21 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install  --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
 
 # 安装PyTorch、torchvision、torchaudio（严格版本对应，官方whl源，禁用缓存）
-RUN pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir
+# 使用一个小的重试循环来避免单次下载超时导致构建失败；同时把pip超时设置延长。
+RUN set -eux; \
+    MAX_ATTEMPTS=6; \
+    attempt=1; \
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do \
+        echo "Attempt $attempt/$MAX_ATTEMPTS: installing torch packages..."; \
+        pip install --retries 5 --timeout 600 torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir && break; \
+        echo "Install failed, sleeping before retry..."; \
+        attempt=$((attempt+1)); \
+        sleep 10; \
+    done; \
+    if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then \
+        echo "Failed to install torch after $MAX_ATTEMPTS attempts" >&2; \
+        exit 1; \
+    fi
 
 # 拉取ComfyUI主程序代码
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
@@ -49,6 +63,7 @@ for repo in \
     "kijai/ComfyUI-WanAnimatePreprocess" \
     "jamesWalker55/comfyui-various" \
     "billwuhao/ComfyUI_IndexTTS" \
+    "wildminder/ComfyUI-VoxCPM" \
     "nunchaku-tech/ComfyUI-nunchaku" \
     "christian-byrne/audio-separation-nodes-comfyui" \
     "cubiq/ComfyUI_IPAdapter_plus" \
