@@ -1,0 +1,121 @@
+# ========================
+# 构建阶段（builder）
+# ========================
+FROM python:3.10.11-slim AS builder
+
+# 设置Python相关环境变量，优化输出和pip行为
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=600
+
+# 安装系统依赖（编译工具、git等）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ python3-dev libffi-dev libssl-dev build-essential git wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升级pip及常用构建工具
+RUN pip install --upgrade pip setuptools wheel 
+
+# 创建虚拟环境，后续所有包都装到这里
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 先安装typing-extensions等，避免PyTorch依赖冲突
+RUN pip install  --retries 4 --timeout 180 typing-extensions decord func_timeout gradio
+
+# 安装PyTorch、torchvision、torchaudio（严格版本对应，官方whl源，禁用缓存）
+# 使用一个小的重试循环来避免单次下载超时导致构建失败；同时把pip超时设置延长。
+RUN set -eux; \
+    MAX_ATTEMPTS=6; \
+    attempt=1; \
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do \
+        echo "Attempt $attempt/$MAX_ATTEMPTS: installing torch packages..."; \
+        pip install --retries 5 --timeout 600 torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir && break; \
+        echo "Install failed, sleeping before retry..."; \
+        attempt=$((attempt+1)); \
+        sleep 10; \
+    done; \
+    if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then \
+        echo "Failed to install torch after $MAX_ATTEMPTS attempts" >&2; \
+        exit 1; \
+    fi
+
+# 拉取ComfyUI主程序代码
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
+
+# 安装ComfyUI主依赖
+RUN pip install  --retries 3 --timeout 180 -r /app/requirements.txt
+
+# 安装或升级 transformers / diffusers 等 HuggingFace 生态依赖，保证 custom nodes 可以导入
+# 我们选择在构建阶段统一安装这些库，避免 custom_nodes 中的不同版本冲突。
+RUN pip install --upgrade --no-cache-dir transformers diffusers accelerate peft huggingface_hub tokenizers
+
+
+# 拉取 custom_nodes 并安装依赖，自动过滤冲突包
+RUN set -e; \
+for repo in \
+    "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
+    "ltdrdata/ComfyUI-Manager" \
+    "XieJunchen/ComfyUI_IndexTTS" \
+    "wildminder/ComfyUI-VoxCPM" \
+    "MinusZoneAI/ComfyUI-CogVideoX-MZ" \
+    ; do \
+    git clone --depth=1 https://github.com/$repo.git /app/custom_nodes/$(basename $repo) || true; \
+    if [ -f /app/custom_nodes/$(basename $repo)/requirements.txt ]; then \
+        sed -i '/diffusers/d;/peft/d;/accelerate/d;/transformers/d' /app/custom_nodes/$(basename $repo)/requirements.txt; \
+        pip install --retries 3 --timeout 180 -r /app/custom_nodes/$(basename $repo)/requirements.txt || true; \
+    fi; \
+    if [ -f /app/custom_nodes/$(basename $repo)/install.py ]; then \
+        python /app/custom_nodes/$(basename $repo)/install.py || true; \
+    fi; \
+done
+
+
+# ========================
+# 生产阶段（production）
+# ========================
+FROM python:3.10.11-slim AS production
+
+# 设置环境变量
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    COMFYUI_PORT=8188 \
+    COMFYUI_HOST=0.0.0.0 \
+    INSTALL_COMFYUI_MANAGER=false
+
+# 安装运行时依赖（直接使用官方 deb.debian.org 源，避免国内镜像慢或丢包）
+RUN set -eux; \
+    echo "deb https://deb.debian.org/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list; \
+    echo "deb https://deb.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list; \
+    echo "deb https://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list; \
+    echo "deb https://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 libgcc-s1 curl ca-certificates git gcc g++; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean
+
+# 复制虚拟环境和主程序代码
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app /app
+
+# 创建非root用户，提升安全性
+RUN groupadd -r comfyui && useradd -r -g comfyui -d /app -s /bin/bash comfyui \
+    && chown -R comfyui:comfyui /opt/venv /app
+
+# 设置工作目录
+WORKDIR /app
+
+# 切换到非root用户
+USER comfyui
+
+# 暴露端口
+EXPOSE $COMFYUI_PORT
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD curl -f http://localhost:$COMFYUI_PORT/ || exit 1
+
+# 启动命令
+CMD ["sh", "-c", "python main.py --listen $COMFYUI_HOST --port $COMFYUI_PORT"]
