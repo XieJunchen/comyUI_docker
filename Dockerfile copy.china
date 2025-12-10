@@ -76,6 +76,23 @@ RUN git clone --depth=2 https://github.com/comfyanonymous/ComfyUI.git /app
 # 先安装 ComfyUI 主依赖（在 builder 环境下），但不安装 custom_nodes 的依赖以避免冲突
 RUN pip install  --retries 3 --timeout 180 -r /app/requirements.txt || true
 
+# 明确安装 runtime 依赖并在安装后校验导入，确保它们被安装到虚拟环境中
+RUN python -m pip install --prefer-binary --no-cache-dir --retries 3 --timeout 180 -c /tmp/constraints.txt safetensors aiohttp
+RUN python - <<'PY'
+import sys
+try:
+    import safetensors
+    import aiohttp
+except Exception as e:
+    print('Runtime dependency import check failed:', e, file=sys.stderr)
+    print('\nInstalled packages:', file=sys.stderr)
+    import pkgutil, pkg_resources
+    import subprocess, sys
+    subprocess.run([sys.executable, '-m', 'pip', 'freeze'], check=False)
+    sys.exit(1)
+print('safetensors and aiohttp import check passed')
+PY
+
 # 拉取 custom_nodes（只 clone），不让 requirements 直接改变已安装的核心包
 RUN set -e; \
 for repo in \

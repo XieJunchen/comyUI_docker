@@ -1,0 +1,23 @@
+# Constraints for builder
+# Pinned versions from Dockerfile.china
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+tokenizers==0.21.2
+diffusers==0.35.1
+transformers==4.54.1
+accelerate==0.34.0
+peft==0.17.1
+huggingface_hub==0.34.0
+moviepy
+numpy==1.26.4
+scipy==1.11.4
+spacy
+stanza==1.1.1
+argostranslate==1.9.6
+emoji==2.14.1
+pynini==2.1.6
+WeTextProcessing
+deep-translator
+sam2==1.1.0
+# allow other packages to be resolved by pip but constrain above
