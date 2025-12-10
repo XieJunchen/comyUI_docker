@@ -1,0 +1,251 @@
+# ========================
+# 构建阶段（builder）
+# ========================
+FROM python:3.10.11-slim AS builder
+
+# 设置Python相关环境变量，优化输出和pip行为
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=600
+
+# 安装系统依赖（编译工具、git等）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ python3-dev libffi-dev libssl-dev build-essential git wget ca-certificates \
+    # 常见编译/二进制包依赖，减少源代码构建失败
+    cmake pkg-config libopenblas-dev libblas-dev liblapack-dev libsndfile1 libsndfile1-dev libjpeg-dev libpng-dev zlib1g-dev \
+    libgomp1 libsndfile1-dev libglib2.0-0 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升级pip及常用构建工具
+RUN pip install --upgrade pip setuptools wheel 
+
+# 创建虚拟环境，后续所有包都装到这里
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 复制 constraints 文件以便在 pip 安装时使用
+COPY constraints.txt /tmp/constraints.txt
+
+# 可选：将主机上的预下载 wheels 复制到镜像中（如果存在这些文件夹）
+# 在构建时把 `builder-scripts/wheels` 放在仓库中即可被复制进来，Dockerfile 会优先使用这些本地 wheel 加速/离线安装
+COPY builder-scripts/wheels /tmp/wheels
+
+# 配置 pip 默认使用国内镜像以提升稳定性（PyTorch 使用指定索引，不受此影响）
+RUN mkdir -p /etc/pip.conf.d \
+    && printf "[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\ntimeout = 120\n" > /etc/pip.conf
+
+# 先安装typing-extensions等，避免PyTorch依赖冲突
+# 不使用 constraints（constraints 包含只在 PyTorch 索引存在的包），以避免索引查找失败
+# 有些镜像索引可能不完整，typing-extensions 从官方 PyPI 更可靠
+RUN pip install --index-url https://pypi.org/simple --retries 4 --timeout 180 --prefer-binary typing-extensions==4.15.0 decord func_timeout gradio
+
+# 安装PyTorch、torchvision、torchaudio（严格版本对应，官方whl源，禁用缓存）
+# 使用一个小的重试循环来避免单次下载超时导致构建失败；同时把pip超时设置延长。
+RUN set -eux; \
+    # 如果 /tmp/wheels 存在且非空，则优先使用本地 wheels（离线/加速安装）；否则回退到官方 PyTorch 索引下载
+    USE_LOCAL_WHEELS=0; \
+    if [ -d /tmp/wheels ] && [ "$(ls -A /tmp/wheels 2>/dev/null | wc -l)" -gt 0 ]; then \
+        echo "Local wheels detected in /tmp/wheels, will attempt offline install first"; \
+        USE_LOCAL_WHEELS=1; \
+    else \
+        echo "No local wheels found, will download from official indexes"; \
+    fi; \
+    MAX_ATTEMPTS=6; \
+    attempt=1; \
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do \
+        echo "Attempt $attempt/$MAX_ATTEMPTS: installing torch packages..."; \
+        if [ "$USE_LOCAL_WHEELS" -eq 1 ]; then \
+            pip install --no-index --find-links /tmp/wheels --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 && break; \
+        else \
+            pip install --retries 5 --timeout 600 torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir && break; \
+        fi; \
+        echo "Install failed, sleeping before retry..."; \
+        attempt=$((attempt+1)); \
+        sleep 10; \
+    done; \
+    if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then \
+        echo "Failed to install torch after $MAX_ATTEMPTS attempts" >&2; \
+        exit 1; \
+    fi
+
+# 拉取ComfyUI主程序代码
+RUN git clone --depth=2 https://github.com/comfyanonymous/ComfyUI.git /app
+
+# 先安装 ComfyUI 主依赖（在 builder 环境下），但不安装 custom_nodes 的依赖以避免冲突
+RUN pip install  --retries 3 --timeout 180 -r /app/requirements.txt || true
+
+# 拉取 custom_nodes（只 clone），不让 requirements 直接改变已安装的核心包
+RUN set -e; \
+for repo in \
+    "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
+    "ltdrdata/ComfyUI-Manager" \
+    "kijai/ComfyUI-SUPIR" \
+    "kijai/ComfyUI-WanVideoWrapper" \
+    "kijai/ComfyUI-HunyuanVideoWrapper" \
+    "kijai/ComfyUI-CogVideoXWrapper" \
+    "kijai/ComfyUI-KJNodes" \
+    "kijai/ComfyUI-DepthAnythingV2" \
+    "kijai/ComfyUI-WanAnimatePreprocess" \
+    "jamesWalker55/comfyui-various" \
+    "billwuhao/ComfyUI_IndexTTS" \
+    "wildminder/ComfyUI-VoxCPM" \
+    "nunchaku-tech/ComfyUI-nunchaku" \
+    "christian-byrne/audio-separation-nodes-comfyui" \
+    "cubiq/ComfyUI_IPAdapter_plus" \
+    "Kosinkadink/ComfyUI-AnimateDiff-Evolved" \
+    "Fannovel16/comfyui_controlnet_aux" \
+    "pythongosssss/ComfyUI-Custom-Scripts" \
+    "ltdrdata/ComfyUI-Impact-Pack" \
+    "AIGODLIKE/AIGODLIKE-ComfyUI-Translation" \
+    "aigc-apps/EasyAnimate" \
+    "city96/ComfyUI-GGUF" \
+    "rgthree/rgthree-comfy" \
+    "Lightricks/ComfyUI-LTXVideo" \
+    "cubiq/ComfyUI_InstantID" \
+    "yolain/ComfyUI-Easy-Use" \
+    "XLabs-AI/x-flux-comfyui" \
+    "WASasquatch/was-node-suite-comfyui" \
+    "logtd/ComfyUI-Fluxtapoz" \
+    "jags111/efficiency-nodes-comfyui" \
+    "kijai/ComfyUI-Florence2" \
+    "AlekPet/ComfyUI_Custom_Nodes_AlekPet" \
+    "crystian/ComfyUI-Crystools" \
+    "ssitu/ComfyUI_UltimateSDUpscale" \
+    "Kosinkadink/ComfyUI-VideoHelperSuite" \
+    "Acly/comfyui-inpaint-nodes" \
+    "Suzie1/ComfyUI_Comfyroll_CustomNodes" \
+    "nullquant/ComfyUI-BrushNet" \
+    "cubiq/PuLID_ComfyUI" \
+    "cubiq/ComfyUI_essentials" \
+    "welltop-cn/ComfyUI-TeaCache" \
+    "chrisgoringe/cg-use-everywhere" \
+    "Fannovel16/ComfyUI-Frame-Interpolation" \
+    "lquesada/ComfyUI-Inpaint-CropAndStitch" \
+    "TTPlanetPig/Comfyui_TTP_Toolset" \
+    "melMass/comfy_mtb" \
+    "john-mnz/ComfyUI-Inspyrenet-Rembg" \
+    "EvilBT/ComfyUI_SLK_joy_caption_two" \
+    "chflame163/ComfyUI_LayerStyle_Advance" \
+    "logtd/ComfyUI-MochiEdit" \
+    "facok/ComfyUI-HunyuanVideoMultiLora" \
+    "MinusZoneAI/ComfyUI-CogVideoX-MZ" \
+    "facok/ComfyUI-TeaCacheHunyuanVideo" \
+    "XieJunchen/comfyUI_LLM" \
+    "chflame163/ComfyUI_LayerStyle" \
+    "cubiq/ComfyUI_FaceAnalysis" \
+    "nicofdga/DZ-FaceDetailer" \
+    "LAOGOU-666/Comfyui_LG_Tools" \
+    "evanspearman/ComfyMath" \
+    ; do \
+    git clone --depth=1 https://github.com/$repo.git /app/custom_nodes/$(basename $repo) || true; \
+    # 过滤会引起冲突的顶级大包，并仅记录 requirements，实际安装在下一步以 --no-deps 方式进行
+    if [ -f /app/custom_nodes/$(basename $repo)/requirements.txt ]; then \
+        sed -i '/diffusers/d;/peft/d;/accelerate/d;/transformers/d' /app/custom_nodes/$(basename $repo)/requirements.txt; \
+    fi; \
+    if [ -f /app/custom_nodes/$(basename $repo)/install.py ]; then \
+        # 仅 clone，延后执行 install.py（部分脚本依赖已统一安装）
+        true; \
+    fi; \
+done
+
+
+# 统一主依赖版本，彻底覆盖所有冲突
+## 统一核心依赖版本：先集中安装可能产生冲突的包，保证自上而下的稳定性
+RUN pip install --prefer-binary --no-cache-dir --retries 3 --timeout 180 -c /tmp/constraints.txt \
+    tokenizers==0.21.2 diffusers==0.35.1 transformers==4.54.1 accelerate==0.34.0 peft==0.17.1 huggingface_hub==0.34.0 moviepy numpy==1.26.4 scipy==1.11.4 spacy || true
+
+RUN pip install --prefer-binary --no-cache-dir --retries 3 --timeout 180 -c /tmp/constraints.txt stanza==1.1.1 argostranslate==1.9.6 || true
+RUN pip install --prefer-binary --no-cache-dir --retries 3 --timeout 180 -c /tmp/constraints.txt emoji==2.14.1 || true
+
+# 注意：pynini 与 sam2 等包在无预编译 wheel环境下常常编译失败。尝试安装若失败则跳过并在构建日志中记录
+RUN pip install --prefer-binary --no-cache-dir --retries 3 --timeout 180 -c /tmp/constraints.txt pynini==2.1.6 WeTextProcessing deep-translator || echo "pynini install failed, skipping"
+
+# 临时从源码安装 SAM-2/3，使用 --no-deps 避免它们在安装时拉取/覆盖不兼容的大包（例如 CUDA/NumPy）
+# 对 sam2 设置 SAM2_BUILD_CUDA=1（若需要源码编译 CUDA 扩展），对 sam3 同样以可控方式安装
+RUN set -eux; \
+    cd /opt || true; \
+    git clone --depth=1 https://github.com/facebookresearch/sam2.git sam2 || true; \
+    if [ -d /opt/sam2 ]; then \
+        cd /opt/sam2; \
+        # 如果存在 CUDA（nvcc 或 /usr/local/cuda），则尝试编译 CUDA 扩展，否则禁用 CUDA 构建以避免失败
+        if command -v nvcc >/dev/null 2>&1 || [ -d /usr/local/cuda ]; then \
+            echo "CUDA detected: building sam2 with CUDA support"; \
+            SAM2_BUILD_CUDA=1 pip install -e . --no-deps --no-build-isolation 2>&1 | tee /var/log/sam2-install.log || echo "sam2 editable install (CUDA) failed"; \
+        else \
+            echo "No CUDA detected: installing sam2 without CUDA extensions"; \
+            SAM2_BUILD_CUDA=0 pip install -e . --no-deps --no-build-isolation 2>&1 | tee /var/log/sam2-install.log || echo "sam2 editable install (no-CUDA) failed"; \
+        fi; \
+        cd /opt; \
+    fi; \
+    git clone --depth=1 https://github.com/facebookresearch/sam3.git sam3 || true; \
+    if [ -d /opt/sam3 ]; then \
+        cd /opt/sam3; \
+        pip install -e . --no-deps --no-build-isolation 2>&1 | tee /var/log/sam3-install.log || echo "sam3 editable install failed"; \
+        cd /opt; \
+    fi; \
+    true
+
+# 现在以 --no-deps 模式安装 custom_nodes 的 requirements（已在 clone 过程中移除冲突项）
+RUN set -e; \
+for dir in /app/custom_nodes/*; do \
+    if [ -f "$dir/requirements.txt" ]; then \
+        echo "Installing requirements for $dir" >> /var/log/custom_nodes-install.log 2>&1; \
+        pip install --no-deps --prefer-binary --no-cache-dir -r "$dir/requirements.txt" -c /tmp/constraints.txt 2>&1 | tee -a /var/log/custom_nodes-install.log || true; \
+    fi; \
+    if [ -f "$dir/install.py" ]; then \
+        echo "Running install.py for $dir" >> /var/log/custom_nodes-install.log 2>&1; \
+        python "$dir/install.py" 2>&1 | tee -a /var/log/custom_nodes-install.log || true; \
+    fi; \
+done || true
+
+# 最后校验已安装包的依赖一致性（可帮助发现版本冲突）
+RUN pip check || true
+
+
+# ========================
+# 生产阶段（production）
+# ========================
+FROM python:3.10.11-slim AS production
+
+# 设置环境变量
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    COMFYUI_PORT=8188 \
+    COMFYUI_HOST=0.0.0.0 \
+    INSTALL_COMFYUI_MANAGER=false
+
+# 安装运行时依赖
+RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 libgcc-s1 curl ca-certificates git gcc g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# 复制虚拟环境和主程序代码
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app /app
+
+# 创建非root用户，提升安全性
+RUN groupadd -r comfyui && useradd -r -g comfyui -d /app -s /bin/bash comfyui \
+    && chown -R comfyui:comfyui /opt/venv /app
+
+# 设置工作目录
+WORKDIR /app
+
+# 切换到非root用户
+USER comfyui
+
+# 暴露端口
+EXPOSE $COMFYUI_PORT
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD curl -f http://localhost:$COMFYUI_PORT/ || exit 1
+
+# 启动命令
+CMD ["sh", "-c", "python main.py --listen $COMFYUI_HOST --port $COMFYUI_PORT"]

@@ -49,8 +49,8 @@ RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
 RUN pip install  --retries 3 --timeout 180 -r /app/requirements.txt
 
 # 安装或升级 transformers / diffusers 等 HuggingFace 生态依赖，保证 custom nodes 可以导入
-# 我们选择在构建阶段统一安装这些库，避免 custom_nodes 中的不同版本冲突。
-RUN pip install --upgrade --no-cache-dir transformers diffusers accelerate peft huggingface_hub tokenizers
+# 固定 transformers 版本为 4.40.2，确保 QuantizedCacheConfig 可用，避免 custom node 导入失败。
+RUN pip install --upgrade --no-cache-dir transformers==4.40.2 diffusers accelerate peft huggingface_hub tokenizers
 
 
 # 拉取 custom_nodes 并安装依赖，自动过滤冲突包
