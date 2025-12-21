@@ -1,0 +1,207 @@
+# ========================
+# 构建阶段（builder）
+# ========================
+FROM python:3.10.11-slim AS builder
+
+# 设置Python相关环境变量，优化输出和pip行为
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=600
+
+# 配置 Debian 国内源（使用阿里云镜像，加快构建速度）
+RUN set -eux; \
+    printf 'deb https://mirrors.aliyun.com/debian bookworm main contrib non-free non-free-firmware\n' > /etc/apt/sources.list; \
+    printf 'deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware\n' >> /etc/apt/sources.list; \
+    printf 'deb https://mirrors.aliyun.com/debian-security bookworm-security main contrib non-free non-free-firmware\n' >> /etc/apt/sources.list; \
+    apt-get clean; \
+    apt-get update --allow-releaseinfo-change || apt-get update --allow-unauthenticated --allow-insecure-repositories || apt-get update || true
+
+# 安装系统依赖（编译工具、git等）
+RUN apt-get install -y --allow-unauthenticated --no-install-recommends gcc g++ python3-dev libffi-dev libssl-dev build-essential git wget ca-certificates \
+    # 常见编译/二进制包依赖，减少源代码构建失败
+    cmake pkg-config libopenblas-dev libblas-dev liblapack-dev libsndfile1 libsndfile1-dev libjpeg-dev libpng-dev zlib1g-dev \
+    libgomp1 libsndfile1-dev libglib2.0-0 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升级pip及常用构建工具
+RUN pip install --upgrade pip setuptools wheel 
+
+# 创建虚拟环境，后续所有包都装到这里
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 复制 constraints 文件以便在 pip 安装时使用
+COPY constraints.txt /tmp/constraints.txt
+
+# 可选：将主机上的预下载 wheels 复制到镜像中（如果存在这些文件夹）
+# 在构建时把 `builder-scripts/wheels` 放在仓库中即可被复制进来，Dockerfile 会优先使用这些本地 wheel 加速/离线安装
+COPY builder-scripts/wheels /tmp/wheels
+
+# 配置 pip 默认使用国内镜像以提升稳定性（PyTorch 使用指定索引，不受此影响）
+RUN mkdir -p /etc/pip.conf.d \
+    && printf "[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\ntimeout = 120\n" > /etc/pip.conf
+
+# 先安装typing-extensions等，避免PyTorch依赖冲突
+# 不使用 constraints（constraints 包含只在 PyTorch 索引存在的包），以避免索引查找失败
+# 有些镜像索引可能不完整，typing-extensions 从官方 PyPI 更可靠
+RUN pip install --index-url https://pypi.org/simple --retries 4 --timeout 180 --prefer-binary typing-extensions==4.15.0 decord func_timeout gradio
+
+# 安装PyTorch、torchvision、torchaudio（严格版本对应，官方whl源，禁用缓存）
+# 使用一个小的重试循环来避免单次下载超时导致构建失败；同时把pip超时设置延长。
+RUN set -eux; \
+    # 如果 /tmp/wheels 存在且非空，则优先使用本地 wheels（离线/加速安装）；否则回退到官方 PyTorch 索引下载
+    USE_LOCAL_WHEELS=0; \
+    if [ -d /tmp/wheels ] && [ "$(ls -A /tmp/wheels 2>/dev/null | wc -l)" -gt 0 ]; then \
+        echo "Local wheels detected in /tmp/wheels, will attempt offline install first"; \
+        USE_LOCAL_WHEELS=1; \
+    else \
+        echo "No local wheels found, will download from official indexes"; \
+    fi; \
+    MAX_ATTEMPTS=6; \
+    attempt=1; \
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do \
+        echo "Attempt $attempt/$MAX_ATTEMPTS: installing torch packages..."; \
+        if [ "$USE_LOCAL_WHEELS" -eq 1 ]; then \
+            pip install --no-index --find-links /tmp/wheels --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 && break; \
+        else \
+            pip install --retries 5 --timeout 600 torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir && break; \
+        fi; \
+        echo "Install failed, sleeping before retry..."; \
+        attempt=$((attempt+1)); \
+        sleep 10; \
+    done; \
+    if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then \
+        echo "Failed to install torch after $MAX_ATTEMPTS attempts" >&2; \
+        exit 1; \
+    fi
+
+# 拉取ComfyUI主程序代码
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /app
+
+# 先安装 ComfyUI 主依赖（在 builder 环境下），但不安装 custom_nodes 的依赖以避免冲突
+RUN pip install  --retries 3 --timeout 300 -r /app/requirements.txt || true
+
+# 补充安装 ComfyUI 运行时常用但有时在 requirements.txt 中丢失的包，避免运行时报错
+# 例如：requests（ComfyUI-Manager prestartup），einops（core transforms）
+RUN python -m pip install --index-url https://pypi.org/simple --prefer-binary --no-cache-dir --retries 3 --timeout 180 einops requests || true
+
+# 安装其他 ComfyUI 运行时常见依赖，避免启动时报 ModuleNotFoundError
+RUN python -m pip install --index-url https://pypi.org/simple --prefer-binary --no-cache-dir --retries 3 --timeout 180 psutil GitPython || true
+
+# 明确安装 runtime 依赖（使用官方 PyPI 索引以避免国内镜像缺包），并在安装后校验导入
+RUN python -m pip install --prefer-binary --no-cache-dir --retries 3 --timeout 180 --index-url https://pypi.org/simple safetensors aiohttp
+RUN python - <<'PY'
+import sys
+try:
+    import safetensors
+    import aiohttp
+except Exception as e:
+    print('Runtime dependency import check failed:', e, file=sys.stderr)
+    print('\nInstalled packages:', file=sys.stderr)
+    import pkgutil, pkg_resources
+    import subprocess, sys
+    subprocess.run([sys.executable, '-m', 'pip', 'freeze'], check=False)
+    sys.exit(1)
+print('safetensors and aiohttp import check passed')
+PY
+
+
+# 6. 【200 插件宇宙全家桶】分批次安装逻辑
+WORKDIR /app/custom_nodes
+RUN set -e; \
+    # 分组定义，确保覆盖所有主流插件
+    b1="ltdrdata/ComfyUI-Manager pythongosssss/ComfyUI-Custom-Scripts rgthree/rgthree-comfy cubiq/ComfyUI_essentials yolain/ComfyUI-Easy-Use ChrisGuzman/ComfyUI-Crystools AIGODLIKE/AIGODLIKE-ComfyUI-Translation chrisgoringe/cg-use-everywhere LAOGOU-666/Comfyui_LG_Tools LAOGOU-666/Comfyui-Memory_Cleanup 11dogzi/CYBERPUNK-STYLE-DIY 11dogzi/CYBERPUNK-STYLE-DIY LAOGOU-666/Comfyui-Memory_Cleanup" ; \
+    b2="ltdrdata/ComfyUI-Impact-Pack ltdrdata/ComfyUI-Inspire-Pack ssitu/ComfyUI_UltimateSDUpscale Acly/comfyui-inpaint-nodes chflame163/ComfyUI_LayerStyle chflame163/ComfyUI_LayerStyle_Advance Gourieff/comfyui-reactor-node nicofdga/DZ-FaceDetailer lquesada/ComfyUI-Inpaint-CropAndStitch" ; \
+    b3="Kosinkadink/ComfyUI-AnimateDiff-Evolved Kosinkadink/ComfyUI-VideoHelperSuite Kosinkadink/ComfyUI-Advanced-ControlNet Fannovel16/ComfyUI-Frame-Interpolation kijai/ComfyUI-WanVideoWrapper kijai/ComfyUI-HunyuanVideoWrapper kijai/ComfyUI-CogVideoXWrapper Lightricks/ComfyUI-LTXVideo numz/ComfyUI-SeedVR2_VideoUpscaler Fannovel16/ComfyUI-MimicMotion kijai/ComfyUI-VideoRetalking logtd/ComfyUI-MochiEdit MinusZoneAI/ComfyUI-CogVideoX-MZ" ; \
+    b4="kijai/ComfyUI-Florence2 kijai/ComfyUI-SegmentAnything2 storyicon/comfyui_segment_anything_2 BadCafeCode/comfyui_segment_anything kijai/ComfyUI-DepthAnythingV2 Nuullll/ComfyUI-Anyline Fannovel16/comfyui_controlnet_aux cubiq/ComfyUI_IPAdapter_plus cubiq/ComfyUI_InstantID cubiq/PuLID_ComfyUI cubiq/ComfyUI_FaceAnalysis TencentARC/ComfyUI-MimicBrush" ; \
+    b5="city96/ComfyUI-GGUF XLabs-AI/x-flux-comfy blibla/ComfyUI-Easy-Flux logtd/ComfyUI-Fluxtapoz city96/ComfyUI_ExtraModels mikey/ComfyUI-Mikey-Nodes ShmuelRonani/ComfyUI-F5TTS kijai/ComfyUI-KJNodes kijai/ComfyUI-segment-anything-2 un-seen/comfyui-tensorops kijai/ComfyUI-WanAnimatePreprocess" ; \
+    b6="Clybius/ComfyUI-Extra-Nodes dmarx/ComfyUI-3D-Pack flowtyone/ComfyUI-Flowty-TripoSR Tenney-A/ComfyUI-AudioScheduler WASasquatch/was-node-suite-comfyui jags111/efficiency-nodes-comfyui AlekPet/ComfyUI_Custom_Nodes_AlekPet huchenlei/ComfyUI-IC-Light" ; \
+    for repo in $b1 $b2 $b3 $b4 $b5 $b6; do \
+        dir_name=$(basename $repo); \
+        if [ ! -d "$dir_name" ]; then \
+            git clone --depth=2 https://github.com/$repo.git $dir_name || echo "Clone failed: $repo"; \
+            if [ -f "$dir_name/requirements.txt" ]; then \
+                sed -i -E '/diffusers|peft|accelerate|transformers|torch|numpy|huggingface_hub/d' "$dir_name/requirements.txt"; \
+                pip install --retries 3 --timeout 120 -r "$dir_name/requirements.txt" || true; \
+            fi; \
+        fi; \
+    done
+
+# 7. SAM2 编译安装
+# Clone 并安装 sam2，同时确保目录可作为 package 被 custom_nodes 直接导入
+RUN git clone https://github.com/facebookresearch/sam2.git && \
+    cd sam2 && SAM2_BUILD_CUDA=1 pip install -e . --no-deps || true && \
+    # 如果仓库没有 __init__.py，创建一个占位文件，保证 /app/custom_nodes/sam2 可被 import
+    if [ ! -f /app/custom_nodes/sam2/__init__.py ]; then printf "__version__ = '0'\n" > /app/custom_nodes/sam2/__init__.py; fi
+
+# 8. 锁定核心库版本 (防止版本回退)
+RUN pip install --upgrade "numpy<2.0.0" "transformers>=4.48.0" "diffusers>=0.31.0" "cupy-cuda12x"
+
+## 安装额外的运行时可能需要的包（尽量在构建阶段安装，避免运行时联网）
+# - `rotary_embedding_torch` / `rotary-embedding-torch`: 被一些 video/upscaler 节点需要
+# - `mediapipe`: DZ-FaceDetailer 可能依赖
+# - `sageattention`/`flash-attn`/`xformers`：可选的加速库（若不可用则忽略，不阻塞构建）
+# 将可选且可能需要联网安装的包与模型下载，集中到构建末尾的脚本中，便于维护与可选开关
+RUN set -eux; \
+    # 使用虚拟环境中的 pip/python，统一在构建阶段安装可能需要联网的可选包（失败不阻塞）
+    PIP=/opt/venv/bin/pip; PYTHON=/opt/venv/bin/python; \
+    $PIP install --prefer-binary --no-cache-dir --retries 3 --timeout 180 \
+        torchsde \
+        rotary-embedding-torch rotary_embedding_torch mediapipe sageattention xformers flash-attn || true; \
+    # 预下载 spacy 小模型，避免首次运行时在线下载（失败不致命）
+    $PYTHON - <<'PY'
+import subprocess, sys
+try:
+    subprocess.run([sys.executable, '-m', 'spacy', 'download', 'xx_sent_ud_sm'], check=False)
+except Exception:
+    pass
+PY
+
+
+# ========================
+# 生产阶段（production）
+# ========================
+FROM python:3.10.11-slim AS production
+
+# 设置环境变量
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    COMFYUI_PORT=8188 \
+    COMFYUI_HOST=0.0.0.0 \
+    INSTALL_COMFYUI_MANAGER=false
+
+# 安装运行时依赖
+RUN echo "deb https://mirrors.aliyun.com/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb https://mirrors.aliyun.com/debian bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 libgcc-s1 curl ca-certificates git gcc g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# 复制虚拟环境和主程序代码
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app /app
+
+# 创建非root用户，提升安全性
+RUN groupadd -r comfyui && useradd -r -g comfyui -d /app -s /bin/bash comfyui \
+    && chown -R comfyui:comfyui /opt/venv /app
+
+# 设置工作目录
+WORKDIR /app
+
+# 切换到非root用户
+USER comfyui
+
+# 暴露端口
+EXPOSE $COMFYUI_PORT
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD curl -f http://localhost:$COMFYUI_PORT/ || exit 1
+
+# 启动命令
+CMD ["sh", "-c", "python main.py --listen $COMFYUI_HOST --port $COMFYUI_PORT"]
